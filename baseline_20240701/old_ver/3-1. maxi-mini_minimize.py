@@ -65,7 +65,7 @@ def get_solution(K:int, all_orders:list[Order], rider:Rider, used_order:list[int
         return [], []
 
 
-def algorithm(K, all_orders:list[Order], all_riders:list[Rider], dist_mat, timelimit=60):
+def algorithm(K, all_orders, all_riders, dist_mat, timelimit=60):
 
     start_time = time.time()
     sorted_list_with_indices = sorted(enumerate(all_orders), key=lambda x:x[1].ready_time, reverse=True)

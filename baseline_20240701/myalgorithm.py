@@ -6,72 +6,77 @@ import sys
 import random
 
 debugging = True
-def get_solution(K:int, all_orders:list[Order], rider:Rider, used_order:list[int], dist_mat, maxnum_order, sorted_index, blacklist = [],trial = 0):
-    if trial > K:
-        return [], []
+def get_solution(K:int, all_orders:list[Order], sorted_orders:list[list[int,Order,int]], rider:Rider, used_order:set[int], dist_mat, pivot):
+    possibility_index = sorted_orders[pivot][2]
+    if possibility_index <= pivot:
+        if test_route_feasibility(all_orders, rider, [sorted_orders[pivot][0]], [sorted_orders[pivot][0]]) == 0:
+            return [sorted_orders[pivot][0]], [sorted_orders[pivot][0]], [pivot]
+        return [], [], []
     # Create a new model
     m = gp.Model()
 
     # Create variables
     list_var = []
-    for i in range(K):
+    for i in range(pivot,possibility_index+1):
         list_var.append(m.addVar(vtype='B'))
     
     volume_constraint = 0
     number_constraint = 0
     used_order_constraint = 0
 
-    i = 0
-    for ord in all_orders:
-        volume_constraint += ord.volume * list_var[i] #sum of rider's order volume
-        number_constraint += list_var[i] #number of rider's order
-        i += 1
+    for i in range(pivot,possibility_index+1):
+        volume_constraint += sorted_orders[i][1].volume * list_var[i-pivot] #sum of rider's order volume
+        number_constraint += list_var[i-pivot] #number of rider's order
         
     for j in used_order:
-        used_order_constraint += list_var[j] # there should be no used order (duplicated order)
+        if pivot <= j <= possibility_index:
+            used_order_constraint += list_var[j-pivot] # there should be no used order (duplicated order)
 
-    maxi = m.addVar(vtype=GRB.INTEGER,name="maxi",lb=0)
-    mini = m.addVar(vtype=GRB.INTEGER,name="mini",lb=0)
-
-    for i in range(K):
-        m.addConstr(maxi>=sorted_index[i]*list_var[i])
-        m.addConstr(mini<=sorted_index[i]*list_var[i])
-
-    objective_function = maxi-mini
-    m.setObjective(objective_function, GRB.MINIMIZE)
+    objective_function = number_constraint
+    m.setObjective(objective_function, GRB.MAXIMIZE)
 
     # Add constraints
     m.addConstr(volume_constraint <= rider.capa)
-    m.addConstr(number_constraint == maxnum_order)
     m.addConstr(used_order_constraint == 0)
-
-    for i in range(len(blacklist)//2):
-        m.addConstr(list_var[blacklist[2*i]] + list_var[blacklist[2*i+1]] <= 1)
+    m.addConstr(list_var[0] == 1)
 
     # Solve it!
     m.optimize()
 
     if m.Status == GRB.OPTIMAL:
-        tmp_seq = [i for i in range(K) if list_var[i].X==1]
+        tmp_seq = [sorted_orders[i][0] for i in range(pivot,possibility_index+1) if list_var[i-pivot].X==1]
+        sorted_used = [i for i in range(pivot, possibility_index+1) if list_var[i-pivot].X==1]
         for shop_perm in permutations(tmp_seq):
             for dlv_perm in permutations(tmp_seq):
                 if test_route_feasibility(all_orders, rider, shop_perm, dlv_perm) == 0:
-                    return list(shop_perm), list(dlv_perm)
+                    return list(shop_perm), list(dlv_perm), sorted_used
 
-        blacklist_max = max(tmp_seq,key=lambda x:sorted_index[x])
-        blacklist_min = min(tmp_seq,key=lambda x:sorted_index[x])
-        return get_solution(K,all_orders,rider,used_order,dist_mat,maxnum_order,sorted_index,blacklist+[blacklist_max,blacklist_min],trial+1)
+        sorted_orders[pivot][2] = max(pivot,(possibility_index+pivot)//2)
+        return get_solution(K,all_orders,sorted_orders,rider,used_order,dist_mat,pivot)
     else:
-        return [], []
+        return [], [], []
 
 
 def algorithm(K, all_orders, all_riders, dist_mat, timelimit=60):
 
     start_time = time.time()
-    sorted_list_with_indices = sorted(enumerate(all_orders), key=lambda x:x[1].ready_time, reverse=True)
-    sorted_index = [0] * K
-    for sorted_i, (original_index, value) in enumerate(sorted_list_with_indices):
-        sorted_index[original_index] = sorted_i
+    sorted_orders = [[i,all_orders[i],-1] for i in range(K)] # [original index, Order, possibility index]
+    sorted_orders.sort(key=lambda x:x[1].ready_time)
+
+    for i in range(K):
+        possibility_index = i
+        while True:
+            if possibility_index >= K:
+                possibility_index = K-1
+                break
+            if sorted_orders[i][1].deadline < sorted_orders[possibility_index][1].ready_time:
+                possibility_index -= 1
+                if possibility_index < i:
+                    possibility_index = i
+                break
+            possibility_index += 1
+        
+        sorted_orders[i][2] = possibility_index
 
     for r in all_riders:
         r.T = np.round(dist_mat/r.speed + r.service_time)
@@ -91,49 +96,35 @@ def algorithm(K, all_orders, all_riders, dist_mat, timelimit=60):
         if r.type == 'CAR':
             rider["car"] = r
 
+    all_bundles = []
+    used_order = set()
+    available_number = {"walk":rider["walk"].available_number,"bike":rider["bike"].available_number,"car":rider["car"].available_number}
+    for i in range(K):
+        if time.time() - start_time > timelimit:
+            break
+        if i in used_order:
+            continue
+        if sorted_orders[i][1].volume <= rider["walk"].capa//2 and available_number["walk"] > 0:
+            wbc = "walk"
+        elif sorted_orders[i][1].volume <= rider["bike"].capa//2 and available_number["bike"] > 0:
+            wbc = "bike"
+        else:
+            wbc = "car"
+        shop_pem, dlv_pem, new_used_orders = get_solution(K, all_orders, sorted_orders, rider[wbc], used_order, dist_mat, i)
 
-    #searching_order = [("car",4),("bike",3),("car",3),("walk",2),("bike",2),("walk",1),("car",2),("bike",1)]
+        used_order.update(new_used_orders)
+        if shop_pem:
+            new_bundle = Bundle(all_orders, rider[wbc], shop_pem, dlv_pem, get_total_volume(all_orders,shop_pem), get_total_distance(K,dist_mat,shop_pem, dlv_pem))
+            available_number[wbc] -= 1
+            all_bundles.append(new_bundle)
 
-    searching_orders = [
-        #[("bike",4), ("bike",3),("car",3),("car",2),("bike",2),("walk",1),("bike",1),("car",1)],
-        #[("car",4),("walk",2),("bike",3),("car",3),("bike",2),("walk",1),("car",2),("bike",1)],
-        [("bike",4),("car",4),("bike",3),("car",3),("bike",2),("car",2),("walk",1),("bike",1)]
-    ]
-
-    for searching_order in searching_orders:
-        all_bundles = []
-        used_order = []
-        available_number = {"walk":rider["walk"].available_number,"bike":rider["bike"].available_number,"car":rider["car"].available_number}
-        searching_order_done = False
-        for wbc, n_order in searching_order:
-            while available_number[wbc]>0:
-                if time.time() - start_time > timelimit:
-                        break
-                shop_pem, dlv_pem = get_solution(K, all_orders, rider[wbc], used_order, dist_mat, n_order, sorted_index)
-                used_order += shop_pem
-
-                if shop_pem:
-                    new_bundle = Bundle(all_orders, rider[wbc], shop_pem, dlv_pem, get_total_volume(all_orders,shop_pem), get_total_distance(K,dist_mat,shop_pem, dlv_pem))
-                    available_number[wbc] -= 1
-                    all_bundles.append(new_bundle)
-                else:
-                    break
-                if len(used_order)==K:
-                    searching_order_done = True
-                    break
-
-            if searching_order_done:
-                if avg_cost > get_avg_cost(all_orders, all_bundles):
-                    solution = [[bundle.rider.type, bundle.shop_seq, bundle.dlv_seq] for bundle in all_bundles]
-                break
-
-        if len(used_order)!=K:
-            for i in range(K):
-                if i not in used_order:
-                    new_bundle = Bundle(all_orders, rider["car"], [i], [i], get_total_volume(all_orders,[i]), get_total_distance(K,dist_mat,[i], [i]))
-                    all_bundles.append(new_bundle)
-            if avg_cost > get_avg_cost(all_orders, all_bundles):
-                    solution = [[bundle.rider.type, bundle.shop_seq, bundle.dlv_seq] for bundle in all_bundles]
+    if len(used_order)!=K:
+        for i in range(K):
+            if i not in used_order:
+                tmpi = sorted_orders[i][0]
+                new_bundle = Bundle(all_orders, rider["car"], [tmpi], [tmpi], get_total_volume(all_orders,[tmpi]), get_total_distance(K,dist_mat,[tmpi], [tmpi]))
+                all_bundles.append(new_bundle)
+    solution = [[bundle.rider.type, bundle.shop_seq, bundle.dlv_seq] for bundle in all_bundles]
         
     return solution
 
