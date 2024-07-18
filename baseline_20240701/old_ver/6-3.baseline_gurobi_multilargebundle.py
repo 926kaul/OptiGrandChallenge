@@ -5,10 +5,10 @@ from gurobipy import GRB
 import sys
 
 # 프로세스 하나가 이 함수를 실행함
-def merge(q, K, all_orders, all_riders, dist_mat, initial_merge, timelimit):
+def merge(q, K, all_orders, dist_mat, initial_merge, timelimit):
     start_time = time.time()
 
-    # [i], 'BIKE'/'CAR'/'WALK', [i], [i], dist_mat[i][i+k]
+    # [i], rider_class, [i], [i], dist_mat[i][i+k]
     merge_result = initial_merge
     i, j = 0, 1
     j_start = 1
@@ -78,8 +78,74 @@ def merge(q, K, all_orders, all_riders, dist_mat, initial_merge, timelimit):
         if time.time() - start_time > timelimit:
             break
 
+def large_bundle(q2, K:int, all_orders:list[Order], all_riders, merge_result, dist_mat, sorted_index, started_time, timelimit):
+    def get_large_bundle(q2, K:int, all_orders:list[Order], rider:Rider, merge_result, dist_mat, size_bundle, sorted_index, blacklist,trial = 0):
+        if trial > K:
+            return
+        if time.time() - started_time > timelimit:
+            return
+        # Create a new model
+        m = gp.Model()
 
-def get_solution(K,available_numbers,merge_result):
+        # Create variables
+        list_var = []
+        for i in range(K):
+            list_var.append(m.addVar(vtype='B'))
+        
+        volume_constraint = 0
+        number_constraint = 0
+
+        i = 0
+        for ord in all_orders:
+            volume_constraint += ord.volume * list_var[i] #sum of rider's order volume
+            number_constraint += list_var[i] #number of rider's order
+            i += 1
+
+        maxi = m.addVar(vtype=GRB.INTEGER,name="maxi",lb=0)
+        mini = m.addVar(vtype=GRB.INTEGER,name="mini",lb=0)
+
+        for i in range(K):
+            m.addConstr(maxi>=sorted_index[i]*list_var[i])
+            m.addConstr(mini<=sorted_index[i]*list_var[i])
+
+        objective_function = maxi-mini
+        m.setObjective(objective_function, GRB.MINIMIZE)
+
+        # Add constraints
+        m.addConstr(volume_constraint <= rider.capa)
+        m.addConstr(number_constraint == size_bundle)
+
+        for item in blacklist:
+            discovered_constraint = 0
+            for i in item:
+                discovered_constraint += list_var[i]
+            m.addConstr(discovered_constraint < len(item))
+
+        # Solve it!
+        m.optimize()
+
+        if m.Status == GRB.OPTIMAL:
+            tmp_seq = [i for i in range(K) if list_var[i].X==1]
+            blacklist.append(tmp_seq)
+            for shop_perm in permutations(tmp_seq):
+                for dlv_perm in permutations(tmp_seq):
+                    if test_route_feasibility(all_orders, rider, shop_perm, dlv_perm) == 0:
+                        merge_result.append([tmp_seq,rider,list(shop_perm),list(dlv_perm),get_total_distance(K, dist_mat, shop_perm, dlv_perm)])
+            q2.put(merge_result)
+            return get_large_bundle(q2, K, all_orders, rider, merge_result, dist_mat, size_bundle, sorted_index, blacklist, trial+1)
+        return
+    
+    size_bundle = 3
+    while True:
+        if time.time() - started_time > timelimit:
+            return
+        for rider in all_riders:
+            get_large_bundle(q2, K,all_orders,rider,merge_result,dist_mat,size_bundle,sorted_index,[])
+        size_bundle += 1
+
+
+
+def get_solution(K,available_numbers,merge_result,started_time,timelimit):
     # Create a new model
     m = gp.Model()
     h = len(merge_result)
@@ -115,6 +181,8 @@ def get_solution(K,available_numbers,merge_result):
         objective_function += list_var[j] * (merge_result[j][1].fixed_cost + merge_result[j][1].var_cost*merge_result[j][4]/100.0)
     m.setObjective(objective_function, GRB.MINIMIZE)
 
+
+    m.setParam('TimeLimit', max(0,timelimit-(time.time()-started_time)))
     # Solve it!
     m.optimize()
 
@@ -159,41 +227,45 @@ def algorithm(K, all_orders, all_riders, dist_mat, timelimit=58):
     # 또한 pickle이라는 개념때문에 넘긴 class는 메서드나 nested class 사용 불가
     # 그래서 merge함수 안에는 메서드를 사용하지 않음
     q = Queue()
-    p = Process(target=merge, args=(q, K, all_orders, all_riders, dist_mat, merge_result, timelimit-1))
+    p = Process(target=merge, args=(q, K, all_orders, dist_mat, merge_result, timelimit-1))
     p.start()
+
+    q2 = Queue()
+    sorted_list_with_indices = sorted(enumerate(all_orders), key=lambda x:x[1].ready_time, reverse=True)
+    sorted_index = [0] * K
+    for sorted_i, (original_index, value) in enumerate(sorted_list_with_indices):
+        sorted_index[original_index] = sorted_i
+    p2 = Process(target=large_bundle, args=(q2, K, all_orders, all_riders, [], dist_mat, sorted_index, start_time, timelimit-1))
+    p2.start()
 
     # A solution is a list of bundles
     solution = []
-    result_set = set()
-    result = []
     best_cost = np.inf
 
     while True:
         if time.time() - start_time > timelimit:
             break
-
+        
         # 다른 프로세스의 결과 가져오기
         if not q.empty():
             merge_result = q.get()
-            for item in merge_result:
-                if not isinstance(item, tuple):
-                    print(item)
-            result += [item for item in merge_result if item not in result_set]
-            result_set = result_set | set(merge_result)
+            if not q2.empty():
+                print("<alpha>")
+                alpha_merge_result = q2.get()
+                if alpha_merge_result:
+                    print(alpha_merge_result[-1])
+                merge_result += alpha_merge_result
 
-        # merge result 나오는 형태
-        
-        print("<processing>")
-        print(len(result))
-        
-        tmp_solution, tmp_cost = get_solution(K,available_numbers,result)
+            # merge result 나오는 형태
+            tmp_solution, tmp_cost = get_solution(K,available_numbers,merge_result,start_time,timelimit)
 
-        if tmp_cost <= best_cost:
-            best_cost = tmp_cost
-            solution = tmp_solution
-        # 현재 solution 결과 생성\
+            if tmp_cost <= best_cost:
+                best_cost = tmp_cost
+                solution = tmp_solution
+    # 현재 solution 결과 생성\
 
     p.terminate()
+    p2.terminate()
 
     #------------- End of custom algorithm code--------------/
 

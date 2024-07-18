@@ -164,8 +164,6 @@ def algorithm(K, all_orders, all_riders, dist_mat, timelimit=58):
 
     # A solution is a list of bundles
     solution = []
-    result_set = set()
-    result = []
     best_cost = np.inf
 
     while True:
@@ -175,18 +173,10 @@ def algorithm(K, all_orders, all_riders, dist_mat, timelimit=58):
         # 다른 프로세스의 결과 가져오기
         if not q.empty():
             merge_result = q.get()
-            for item in merge_result:
-                if not isinstance(item, tuple):
-                    print(item)
-            result += [item for item in merge_result if item not in result_set]
-            result_set = result_set | set(merge_result)
 
         # merge result 나오는 형태
         
-        print("<processing>")
-        print(len(result))
-        
-        tmp_solution, tmp_cost = get_solution(K,available_numbers,result)
+        tmp_solution, tmp_cost = get_solution(K,available_numbers,merge_result)
 
         if tmp_cost <= best_cost:
             best_cost = tmp_cost
