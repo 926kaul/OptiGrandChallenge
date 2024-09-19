@@ -1,0 +1,14 @@
+
+Gurobi 11.0.3 (linux64, gurobi_cl) logging started Tue Jul 30 16:15:46 2024
+
+Set parameter LogFile to value "gurobi.log"
+Using license file /home/janghankyul/summer2024/Opti/opti/gurobi.lic
+
+Gurobi 11.0.3 (linux64, gurobi_cl) logging started Tue Jul 30 16:16:52 2024
+
+Set parameter WLSAccessID
+Set parameter WLSSecret
+Set parameter LicenseID to value 2531813
+Set parameter LogFile to value "gurobi.log"
+Using license file /home/janghankyul/summer2024/Opti/opti/gurobi.lic
+Academic license 2531813 - for non-commercial use only - registered to ji___@kaist.ac.kr

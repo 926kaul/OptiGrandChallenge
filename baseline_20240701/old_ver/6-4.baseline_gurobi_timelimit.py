@@ -79,7 +79,7 @@ def merge(q, K, all_orders, all_riders, dist_mat, initial_merge, timelimit):
             break
 
 
-def get_solution(K,available_numbers,merge_result):
+def get_solution(K,available_numbers,merge_result,started_time,timelimit):
     # Create a new model
     m = gp.Model()
     h = len(merge_result)
@@ -115,6 +115,7 @@ def get_solution(K,available_numbers,merge_result):
         objective_function += list_var[j] * (merge_result[j][1].fixed_cost + merge_result[j][1].var_cost*merge_result[j][4]/100.0)
     m.setObjective(objective_function, GRB.MINIMIZE)
 
+    m.setParam('TimeLimit', max(0,timelimit-(time.time()-started_time)))
     # Solve it!
     m.optimize()
 
@@ -176,7 +177,7 @@ def algorithm(K, all_orders, all_riders, dist_mat, timelimit=58):
 
         # merge result 나오는 형태
         
-        tmp_solution, tmp_cost = get_solution(K,available_numbers,merge_result)
+        tmp_solution, tmp_cost = get_solution(K,available_numbers,merge_result,start_time,timelimit)
 
         if tmp_cost <= best_cost:
             best_cost = tmp_cost

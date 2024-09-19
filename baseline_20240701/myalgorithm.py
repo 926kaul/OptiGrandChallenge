@@ -2,96 +2,200 @@ from util import *
 from multiprocessing import Process, Queue
 import gurobipy as gp
 from gurobipy import GRB
+from collections import defaultdict
+import itertools
 import sys
 
-# 프로세스 하나가 이 함수를 실행함
-def merge(q, K, all_orders, all_riders, dist_mat, initial_merge, timelimit):
-    start_time = time.time()
+# 가능한 order 조합을 찾으면 possible_bundle 클래스로 저장하여 활용한다
+# pickling 가능하게 하기 위해 init을 제외한 메소드를 사용하지 않음
+class possible_bundle:
+    def __init__(self, rider : str, shop_seq, dlv_seq, cost):
+        self.rider = rider
+        self.shop_seq = shop_seq
+        self.dlv_seq = dlv_seq
+        self.cost = cost
 
-    # [i], 'BIKE'/'CAR'/'WALK', [i], [i], dist_mat[i][i+k]
-    merge_result = initial_merge
-    i, j = 0, 1
-    j_start = 1
-    last_point = len(merge_result)
+# rider_of_choice는 CAR, BIKE, ALL중 combination을 만들 때 사용할 rider 그래프를 결정 p1
+# sparse graph(1_1, 1_2, 1_17 등)은 20초 안에 3개의 order합친 bundle을 전부 찾아냄 - 1_1로 테스트함
+# dense graph(1_10, 1_18)은 1분 안에 3개의 order합친 bundle을 전부 찾아내지 못함 - 1_18로 테스트함
+def merge(q, K, all_orders, all_riders, dist_mat, merge_possible, rider_of_choice, start_time, timelimit):
 
-    # 최소 거리를 찾는 함수
-    # 이 부분에서 최적화 할 수 있음
-    # (가장 짧은 거리가 가능한 배달경로라는 보장이 없기 때문)
-    def min_dist(orders):
-        best_dist = np.inf
-        best_shop_seq = None
-        best_dlv_seq = None
-
-        for shop_seq in permutations(orders):
-            for dlv_seq in permutations(orders):
-                dist = get_total_distance(K, dist_mat, shop_seq, dlv_seq)
-                if dist < best_dist:
-                    best_dist = dist
-                    best_shop_seq = shop_seq
-                    best_dlv_seq = dlv_seq
-
-        return list(best_shop_seq), list(best_dlv_seq), best_dist
-
-    # 두 번들을 합치는 함수
-    # 위 가장 min_dist()를 사용하여 route 생성,
-    # test_route_feasibility 함수를 사용하여 가능한 경로인지 확인
-    def merge_bundles(i, j):
-        orders = merge_result[i][0] + merge_result[j][0]
-        rider = merge_result[i][1]
-        shop_seq, dlv_seq, dist = min_dist(orders)
-
-        if test_route_feasibility(all_orders, rider, shop_seq, dlv_seq) == 0:
-            return (orders, rider, shop_seq, dlv_seq, dist)
-        return None
-
-    # 두 번들을 합치는 함수를 반복하는 함수
-    # for문을 사용하지 않은 이유는 1000번 반복하면 q에 결과를 넣어주기 위함
-    while True:
-        iter = 0
-        max_merge_iter = 1000
-        while iter < max_merge_iter:
-            if merge_result[i][1] == merge_result[j][1] and (not(set(merge_result[i][0])&set(merge_result[j][0]))):
-                # 원래 merge_result의 뒤에만 추가
-                # 즉, 두 프로세스 전부 앞의 순서는 동일함
-                new_bundle = merge_bundles(i, j)
-                if new_bundle is not None:
-                    merge_result.append(new_bundle)
-
-                else:
-                    iter += 1
-
-            j += 1
-            if j == last_point:
-                i += 1
-                j = max(i + 1, j_start)
+    rider = {}
+    for r in all_riders:
+        r = Rider([r.type, r.speed, r.capa, r.var_cost, r.fixed_cost, r.service_time, r.available_number])
+        if r.type == 'WALK':
+            rider["WALK"] = r
+        if r.type == 'CAR':
+            rider["CAR"] = r
+        if r.type == 'BIKE':
+            rider["BIKE"] = r
         
-            if i == last_point - 1:
-                i, j = 0, last_point
-                j_start = last_point
-                if last_point == len(merge_result):
-                    break
-                last_point = len(merge_result)
-        
-        # queue 결과 보내는 함수
-        q.put(merge_result)
+        r.T = np.round(dist_mat/r.speed + r.service_time)
 
+    id_lst = sorted(list(range(K)),key = lambda x:len(merge_possible[rider_of_choice][x]))
+
+    queue = []
+    considered = set()
+    
+    for order_id in id_lst:
+        for order1, order2 in itertools.combinations(merge_possible[rider_of_choice][order_id], 2):
+            tmp_tuple = tuple(sorted([order_id, order1, order2]))
+            if tmp_tuple in considered:
+                continue
+            considered.add(tmp_tuple)
+
+            for rider_type, rider_inst in rider.items():
+                optimal_route_found = None
+                cost = np.inf
+                for shop_seq in permutations(tmp_tuple):
+                    for dlv_seq in permutations(tmp_tuple):
+                        if test_route_feasibility(all_orders, rider_inst, shop_seq, dlv_seq) == 0:
+                            cur_cost = rider_inst.calculate_cost(get_total_distance(K, dist_mat, shop_seq, dlv_seq))
+                            if cur_cost < cost:
+                                cost = cur_cost
+                                optimal_route_found = possible_bundle(rider_type, shop_seq, dlv_seq, cur_cost)
+                
+                if optimal_route_found:
+                    queue.append(optimal_route_found)
+
+                # # decided that speed is not that different
+                # for shop_seq in permutations([order_id, order1, order2]):
+                #     for dlv_seq in permutations([order_id, order1, order2]):
+                #         if test_route_feasibility(all_orders, rider_inst, shop_seq, dlv_seq) == 0:
+                #             cur_cost = rider_inst.calculate_cost(get_total_distance(K, dist_mat, shop_seq, dlv_seq))
+                #             queue.append([rider_type, shop_seq, dlv_seq, cur_cost])
+                #             break
+        
+
+        if len(queue) > 1000:
+            q.put(queue)
+            queue = []
+        
+        
+        
         if time.time() - start_time > timelimit:
-            break
+            return
+    
+    q.put(queue)
+
+    rider.pop("WALK")
+
+    # 3개의 order을 합친 bundle을 전부 찾으면
+    # 다음으로 4개의 order을 합친 bundle 찾기
+    rider_of_choice = "CAR"
+    for order_id in range(K):
+        for order1, order2 in itertools.combinations(merge_possible[rider_of_choice][order_id], 2):
+            possible_order_set = merge_possible[rider_of_choice][order_id].intersection(merge_possible[rider_of_choice][order1]).intersection(merge_possible[rider_of_choice][order2])
+            for order3 in possible_order_set:
+                tmp_tuple = tuple(sorted([order_id, order1, order2, order3]))
+                if tmp_tuple in considered:
+                    continue
+                considered.add(tmp_tuple)
+
+                for rider_type, rider_inst in rider.items():
+                    if get_total_volume(all_orders, tmp_tuple) > rider_inst.capa:
+                        continue
+                    optimal_route_found = None
+                    cost = np.inf
+                    for shop_seq in permutations(tmp_tuple):
+                        for dlv_seq in permutations(tmp_tuple):
+                            if test_route_feasibility(all_orders, rider_inst, shop_seq, dlv_seq) == 0:
+                                cur_cost = rider_inst.calculate_cost(get_total_distance(K, dist_mat, shop_seq, dlv_seq))
+                                if cur_cost < cost:
+                                    cost = cur_cost
+                                    optimal_route_found = possible_bundle(rider_type, shop_seq, dlv_seq, cur_cost)
+                    
+                    if optimal_route_found:
+                        queue.append(optimal_route_found)
+                
+            if time.time() - start_time > timelimit:
+                return
+        
+
+        if len(queue) > 100:
+            q.put(queue)
+            queue = []
+                    
+
+# 4개 이상의 order를 합치는 함수 p2
+# order K-1에서 시작해서 거슬러 올라감(merge함수가 3 order bundle 찾으면 order 0부터 시작)
+# sparse graph는 1분 안에 merge, merge_4과 합쳐 100개 정도의 4 order bundle을 찾아냄 - 1_1로 테스트함
+# dense graph는 1분 안에 단 하나의 4 order bundle을 찾아냄(즉, K-1만 찾아냄) - 1_18로 테스트함
+def merge_4(q, K, all_orders, all_riders, dist_mat, merge_possible, rider_of_choice, start_time, timelimit):
+
+    rider = {}
+    for r in all_riders:
+        r = Rider([r.type, r.speed, r.capa, r.var_cost, r.fixed_cost, r.service_time, r.available_number])
+        if r.type == 'CAR':
+            rider["CAR"] = r
+        if r.type == 'BIKE':
+            rider["BIKE"] = r
+        
+        r.T = np.round(dist_mat/r.speed + r.service_time)
+
+    queue = []
+    considered = set()
+
+    for order_id in reversed(range(K)):
+        for order1, order2 in itertools.combinations(merge_possible[rider_of_choice][order_id], 2):
+            possible_order_set = merge_possible[rider_of_choice][order_id].intersection(merge_possible[rider_of_choice][order1]).intersection(merge_possible[rider_of_choice][order2])
+            for order3 in possible_order_set:
+                tmp_tuple = tuple(sorted([order_id, order1, order2, order3]))
+                if tmp_tuple in considered:
+                    continue
+                considered.add(tmp_tuple)
+
+                for rider_type, rider_inst in rider.items():
+                    if get_total_volume(all_orders, tmp_tuple) > rider_inst.capa:
+                        continue
+                    optimal_route_found = None
+                    cost = np.inf
+                    for shop_seq in permutations(tmp_tuple):
+                        for dlv_seq in permutations(tmp_tuple):
+                            if test_route_feasibility(all_orders, rider_inst, shop_seq, dlv_seq) == 0:
+                                cur_cost = rider_inst.calculate_cost(get_total_distance(K, dist_mat, shop_seq, dlv_seq))
+                                if cur_cost < cost:
+                                    cost = cur_cost
+                                    optimal_route_found = possible_bundle(rider_type, shop_seq, dlv_seq, cur_cost)
+                    
+                    if optimal_route_found:
+                        queue.append(optimal_route_found)
+                
+            if time.time() - start_time > timelimit:
+                return
+            
+
+            if len(queue) > 200:
+                queue = []
+                break
+        
+        
+        q.put(queue)
+        
+        
 
 
-def get_solution(K,available_numbers,merge_result):
-    # Create a new model
+# 찾은 bundle 중에서 최적화된 route를 찾는 함수 
+# p0이 사용함
+def get_solution(K,available_numbers, optimal_route,started_time,timelimit):
+
+    # set up gurobi
     m = gp.Model()
-    h = len(merge_result)
+    m.setParam('OutputFlag', 0)
+
+    h = len(optimal_route)
+
     # Create variables
     list_var = []
     for j in range(h):
         list_var.append(m.addVar(vtype='B'))
+
+    # [rider_type, shop_seq, dlv_seq, cur_cost]
     
     for i in range(K):
         used_order_constraint = 0
         for j in range(h):
-            if i in merge_result[j][0]:
+            if i in optimal_route[j].shop_seq:
                 used_order_constraint += list_var[j]
         m.addConstr(used_order_constraint == 1)
 
@@ -99,11 +203,11 @@ def get_solution(K,available_numbers,merge_result):
     walk_constraint = 0
     car_constraint = 0
     for j in range(h):
-        if merge_result[j][1].type == "BIKE":
+        if optimal_route[j].rider == "BIKE":
             bike_constraint += list_var[j]
-        elif merge_result[j][1].type == "WALK":
+        elif optimal_route[j].rider == "WALK":
             walk_constraint += list_var[j]
-        elif merge_result[j][1].type == "CAR":
+        elif optimal_route[j].rider == "CAR":
             car_constraint += list_var[j]
     m.addConstr(bike_constraint <= available_numbers["BIKE"])
     m.addConstr(walk_constraint <= available_numbers["WALK"])
@@ -112,17 +216,142 @@ def get_solution(K,available_numbers,merge_result):
 
     objective_function = 0
     for j in range(h):
-        objective_function += list_var[j] * (merge_result[j][1].fixed_cost + merge_result[j][1].var_cost*merge_result[j][4]/100.0)
+        objective_function += list_var[j] * optimal_route[j].cost
     m.setObjective(objective_function, GRB.MINIMIZE)
 
+    m.setParam('TimeLimit', max(0,timelimit-(time.time()-started_time)))
     # Solve it!
     m.optimize()
 
     if m.Status == GRB.OPTIMAL:
-        return [[merge_result[j][1].type,merge_result[j][2],merge_result[j][3]] for j in range(h) if list_var[j].X==1], m.objVal
+        return [[optimal_route[j].rider, optimal_route[j].shop_seq, optimal_route[j].dlv_seq] for j in range(h) if list_var[j].X>0.5], m.objVal
     else:
         return None, np.inf
 
+
+
+
+
+# 구로비로 최대의 complete graph 찾기 
+# p3에서 사용됨
+#
+#
+# 해당 코드는 버그가 있음
+# matrix가 walk 그래프 기준으로 되어 있음
+# 그러기에 rider_of_choice가 walk일 때만 정상적으로 작동함
+#
+#
+#
+#
+def find_max_complete_graph(merge_possible, matrix, rider_of_choice, max_index):
+
+    m = gp.Model()
+    m.setParam('OutputFlag', 0)
+    
+    key_map = dict()
+    sum_var = 0
+    for i in merge_possible[rider_of_choice][max_index]:
+        key_map[i] = m.addVar(vtype='B')
+        sum_var += key_map[i]
+    for i, j in itertools.combinations(merge_possible[rider_of_choice][max_index], 2):
+        edge = m.addVar(vtype='B')
+        m.addConstr(edge * (1-matrix[i][j]) == 0)
+        m.addConstr(edge >= key_map[i] + key_map[j] - 1)
+    
+    m.setObjective(sum_var, GRB.MAXIMIZE)
+
+    m.optimize()
+
+    if m.Status == GRB.OPTIMAL:
+        tmp_seq = [i for i, val in key_map.items() if val.X>0.5]
+        
+        return len(tmp_seq) + 1
+    
+    return None
+
+
+
+# 최대로 묶일 수 있는 번들부터 찾는 함수 p3
+# 1_18은 여러개를 찾고 1개의 결과만이 활용됨
+# 1_1은 제대로 작동하지 않음(버그 해결 필요)
+def top_down_merge(q, K, matrix, all_orders, dist_mat, all_riders, merge_possible, start_time, timelimit):
+
+    rider = {}
+    for r in all_riders:
+        r = Rider([r.type, r.speed, r.capa, r.var_cost, r.fixed_cost, r.service_time, r.available_number])
+        if r.type == 'WALK':
+            rider["WALK"] = r
+        if r.type == 'CAR':
+            rider["CAR"] = r
+        if r.type == 'BIKE':
+            rider["BIKE"] = r
+        
+        r.T = np.round(dist_mat/r.speed + r.service_time)
+
+    rider_of_choice = "WALK"
+
+    # it just returns the route that comes first so optimation can be done
+    def make_n_len_route(n, rider_of_chocie, index):
+        for combi_list in itertools.combinations(merge_possible[rider_of_choice][index], n):
+            tmp_set = merge_possible[rider_of_chocie][combi_list[0]]
+            for i in combi_list:
+                tmp_set = tmp_set & merge_possible[rider_of_chocie][i]
+            if not tmp_set:
+                continue
+
+            combi_list = list(combi_list)
+            combi_list.append(index)
+            if get_total_volume(all_orders, combi_list) > rider["BIKE"].capa:
+                continue
+
+            for shop_seq in permutations(combi_list):
+                for dlv_seq in permutations(combi_list):
+                    if test_route_feasibility(all_orders, rider["CAR"], shop_seq, dlv_seq) == 0:
+                        cost = rider["CAR"].calculate_cost(get_total_distance(K, dist_mat, shop_seq, dlv_seq))
+                        return possible_bundle("CAR", shop_seq, dlv_seq, cost)
+                    if test_route_feasibility(all_orders, rider["BIKE"], shop_seq, dlv_seq) == 0:
+                        cost = rider["BIKE"].calculate_cost(get_total_distance(K, dist_mat, shop_seq, dlv_seq))
+                        return possible_bundle("BIKE", shop_seq, dlv_seq, cost)
+        
+        return None
+
+
+    index_order = sorted([i for i in range(K)], key = lambda x : len(merge_possible["WALK"][x]), reverse = True)
+    while True:
+        for index in index_order:
+            max_order_len = find_max_complete_graph(merge_possible, matrix, rider_of_choice, index)
+            if rider_of_choice == "WALK" and (not max_order_len or max_order_len <= 4):
+                rider_of_choice = "ALL"
+                index_order = sorted([i for i in range(K)], key = lambda x : len(merge_possible["ALL"][x]), reverse = True)
+                break
+            if not max_order_len:
+                continue
+
+            # 탑 다운 방식으로 route 찾기
+            for i in reversed(range(1, min(max_order_len+1, 6))):
+                route = make_n_len_route(i, rider_of_choice, index)
+                if route:
+                    route_list = [route]
+                    
+                    for i in route.shop_seq:
+                        shop_seq =list(route.shop_seq) 
+                        dlv_seq = list(route.dlv_seq)
+                        shop_seq.remove(i)
+                        dlv_seq.remove(i)
+                        for r in all_riders:
+                            if test_route_feasibility(all_orders, r, shop_seq, dlv_seq) == 0:
+                                cost = r.calculate_cost(get_total_distance(K, dist_mat, shop_seq, dlv_seq))
+                                route_list.append(possible_bundle(r.type, shop_seq, dlv_seq, cost))
+                    
+                    q.put(route_list)
+                    break
+            if time.time() - start_time > timelimit:
+                break
+    
+    
+
+
+# 메인 함수 p0
 def algorithm(K, all_orders, all_riders, dist_mat, timelimit=58):
     start_time = time.time()
 
@@ -132,20 +361,59 @@ def algorithm(K, all_orders, all_riders, dist_mat, timelimit=58):
 
     #------------- Custom algorithm code starts from here --------------#
 
+    rider = {}
     available_numbers = {}
-    for rider in all_riders:
-        if rider.type == 'BIKE':
-            available_numbers['BIKE'] = rider.available_number
-        elif rider.type == 'CAR':
-            available_numbers['CAR'] = rider.available_number
-        elif rider.type == 'WALK':
-            available_numbers['WALK'] = rider.available_number
+    for r in all_riders:
+        if r.type == 'WALK':
+            rider["WALK"] = r
+            available_numbers["WALK"] = r.available_number
+        if r.type == 'CAR':
+            rider["CAR"] = r
+            available_numbers["CAR"] = r.available_number
+        if r.type == 'BIKE':
+            rider["BIKE"] = r
+            available_numbers["BIKE"] = r.available_number
 
-    merge_result = []
+    merge_possible = {}
+    merge_possible["WALK"] = defaultdict(lambda : set())
+    merge_possible["CAR"] = defaultdict(lambda : set())
+    merge_possible["BIKE"] = defaultdict(lambda : set())
+    merge_possible["ALL"] = defaultdict(lambda : set())
+
+    optimal_route = []
+
     for i in range(K):
-        for rider in all_riders:
-            if test_route_feasibility(all_orders, rider, [i], [i]) == 0:
-                merge_result.append(([i],rider,[i],[i],dist_mat[i][i+K]))
+        for r in all_riders:
+            if test_route_feasibility(all_orders, r, [i], [i]) == 0:
+                optimal_route.append(possible_bundle(r.type, [i], [i], r.calculate_cost(get_total_distance(K, dist_mat, [i], [i]))))
+    
+    # connectivity matrix
+    matrix = [[0 for i in range(K)] for j in range(K)]
+    
+    # connectivity matrix 구하기
+    for i in range(K):
+        for j in range(i+1, K):
+            optimal_route_found = {}
+            cost = np.inf
+            for shop_seq in permutations([i,j]):
+                for dlv_seq in permutations([i,j]):
+                    for rider_type, rider_inst in rider.items():
+                        if test_route_feasibility(all_orders, rider[rider_type], shop_seq, dlv_seq) == 0:
+                            merge_possible[rider_type][i].add(j)
+                            merge_possible[rider_type][j].add(i)
+                            merge_possible["ALL"][i].add(j)
+                            merge_possible["ALL"][j].add(i)
+                            cur_cost = rider_inst.calculate_cost(get_total_distance(K, dist_mat, shop_seq, dlv_seq))
+                            if cur_cost < cost:
+                                cost = cur_cost
+                                optimal_route_found[rider_type] = possible_bundle(rider_type, shop_seq, dlv_seq, cur_cost)
+                            if rider_type == "WALK":
+                                matrix[i][j] = 1
+                                matrix[j][i] = 1
+            if optimal_route_found:
+                optimal_route.extend([val for val in optimal_route_found.values()])
+
+    
     # 프로세스 분리
     # 원래는 __name__ == '__main__'으로 실행해야 하지만, 이 경우는 함수로 실행
     # 그래서 multiprocessing은 windows에서 불가능 (wsl 사용 추천)
@@ -158,14 +426,21 @@ def algorithm(K, all_orders, all_riders, dist_mat, timelimit=58):
     #
     # 또한 pickle이라는 개념때문에 넘긴 class는 메서드나 nested class 사용 불가
     # 그래서 merge함수 안에는 메서드를 사용하지 않음
-    q = Queue()
-    p = Process(target=merge, args=(q, K, all_orders, all_riders, dist_mat, merge_result, timelimit-1))
-    p.start()
+    # 아니면 해당 함수 안에서 다시 클래스를 정의해야 함
+    q1 = Queue()
+    p1 = Process(target=merge, args=(q1, K, all_orders, all_riders, dist_mat, merge_possible, "ALL", start_time, timelimit-1))
+    p1.start()
+
+    q2 = Queue()
+    p2 = Process(target=merge_4, args=(q2, K, all_orders, all_riders, dist_mat, merge_possible, "CAR", start_time, timelimit-1))
+    p2.start()
+
+    q3 = Queue()
+    p3 = Process(target=top_down_merge, args=(q3, K, matrix, all_orders, dist_mat, all_riders, merge_possible, start_time, timelimit-1))
+    p3.start()
 
     # A solution is a list of bundles
     solution = []
-    result_set = set()
-    result = []
     best_cost = np.inf
 
     while True:
@@ -173,31 +448,31 @@ def algorithm(K, all_orders, all_riders, dist_mat, timelimit=58):
             break
 
         # 다른 프로세스의 결과 가져오기
-        if not q.empty():
-            merge_result = q.get()
-            for item in merge_result:
-                if not isinstance(item, tuple):
-                    print(item)
-            result += [item for item in merge_result if item not in result_set]
-            result_set = result_set | set(merge_result)
+        while not q1.empty():
+            optimal_route.extend(q1.get())
+
+        while not q2.empty():
+            optimal_route.extend(q2.get())
+
+        while not q3.empty():
+            optimal_route.extend(q3.get())
 
         # merge result 나오는 형태
         
-        print("<processing>")
-        print(len(result))
-        
-        tmp_solution, tmp_cost = get_solution(K,available_numbers,result)
+        tmp_solution, tmp_cost = get_solution(K,available_numbers,optimal_route,start_time,timelimit)
 
         if tmp_cost <= best_cost:
             best_cost = tmp_cost
             solution = tmp_solution
         # 현재 solution 결과 생성\
 
-    p.terminate()
+    p1.terminate()
+    p2.terminate()
+    p3.terminate()
 
     #------------- End of custom algorithm code--------------/
 
 
-    return solution
+    return [[rider, list(shop_seq), list(dlv_seq)] for rider, shop_seq, dlv_seq in solution]
 
 
